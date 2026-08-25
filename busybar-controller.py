@@ -1,412 +1,503 @@
 #!/usr/bin/env python3
 
-import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
-from busylib import BusyBar, types
 
 
-# ----------------------------------------------------------------------
-# Configuration
-# ----------------------------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-BUSYBAR_IP = os.getenv("BUSYBAR_IP", "192.168.84.66")
-BUSYBAR_TOKEN = os.getenv("BUSYBAR_TOKEN")
+# BUSY Bar connection
+BUSYBAR_IP = "10.0.4.20"
+BUSYBAR_BASE_URL = f"http://{BUSYBAR_IP}"
 
-CLOUDFLARE_STATUS_URL = os.getenv("CLOUDFLARE_STATUS_URL", "")
-POLL_SECONDS = int(os.getenv("BUSYBAR_POLL_SECONDS", "30"))
-
-# Don't reprogram a timer merely because a few seconds have elapsed.
-# If the device already has the correct profile and its remaining time
-# is within this tolerance of what the calendar predicts, leave it alone.
-TIMER_TOLERANCE_SECONDS = int(
-    os.getenv("BUSYBAR_TIMER_TOLERANCE_SECONDS", "90")
-)
+# Leave blank for USB / API access without a token.
+BUSYBAR_API_TOKEN = ""
 
 
-# ----------------------------------------------------------------------
-# Logging
-# ----------------------------------------------------------------------
+# Cloudflare status endpoint
+STATUS_URL = "https://busybar-status.matsagerstam.workers.dev/status"
+
+
+# ------------------------------------------------------------
+# STATUS -> BUSY BAR IMAGE/THEME MAPPING
+#
+# These are intentionally kept here at the top so they're
+# trivial to change later.
+# ------------------------------------------------------------
+
+BUSY_THEME = "meeting"
+
+OOO_THEME = "keep_out"
+
+TENTATIVE_THEME = "booked"
+
+
+# BUSY Bar profile slots
+BUSY_SLOT = "busy"
+TENTATIVE_SLOT = "custom"
+OOO_SLOT = "busy"
+
+
+# Poll Cloudflare every N seconds
+POLL_INTERVAL_SECONDS = 30
+
+
+# Small delays between virtual button presses / profile changes.
+DEVICE_SETTLE_SECONDS = 0.5
+
+
+# HTTP timeouts
+BUSYBAR_TIMEOUT_SECONDS = 5
+STATUS_TIMEOUT_SECONDS = 10
+
+
+# If Cloudflare provides an "until" timestamp and that time has
+# already passed, consider the state FREE.
+#
+# This protects against a stale BUSY state if the Windows sender
+# temporarily stops updating Cloudflare.
+HONOR_UNTIL_TIMESTAMP = True
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
+session = requests.Session()
+
+busybar_headers = {}
+
+if BUSYBAR_API_TOKEN:
+    busybar_headers["X-API-Token"] = BUSYBAR_API_TOKEN
+
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 def log(message):
-    print(
-        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}",
-        flush=True,
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {message}", flush=True)
+
+
+# ============================================================
+# BUSY BAR REST API
+# ============================================================
+
+def busybar_get(path):
+    response = session.get(
+        BUSYBAR_BASE_URL + path,
+        headers=busybar_headers,
+        timeout=BUSYBAR_TIMEOUT_SECONDS,
     )
 
-
-# ----------------------------------------------------------------------
-# BUSY Bar connection
-# ----------------------------------------------------------------------
-
-def connect_busybar():
-    log(f"Connecting to BUSY Bar at {BUSYBAR_IP}")
-
-    kwargs = {}
-
-    if BUSYBAR_TOKEN:
-        kwargs["token"] = BUSYBAR_TOKEN
-
-    bb = BusyBar(
-        BUSYBAR_IP,
-        **kwargs,
-    )
-
-    version = bb.version()
-
-    log(
-        "Connected to BUSY Bar. "
-        f"API={version.api_semver or 'unknown'}"
-    )
-
-    return bb
+    response.raise_for_status()
+    return response.json()
 
 
-# ----------------------------------------------------------------------
-# Cloudflare status
-# ----------------------------------------------------------------------
-
-def get_cloudflare_status():
-    response = requests.get(
-        CLOUDFLARE_STATUS_URL,
-        timeout=5,
-        headers={
-            "Cache-Control": "no-cache",
-        },
+def busybar_put(path, payload):
+    response = session.put(
+        BUSYBAR_BASE_URL + path,
+        headers=busybar_headers,
+        json=payload,
+        timeout=BUSYBAR_TIMEOUT_SECONDS,
     )
 
     response.raise_for_status()
 
-    return response.json()
+    if response.content:
+        return response.json()
+
+    return None
 
 
-def parse_until(until):
-    if not until:
+def busybar_post(path, params=None):
+    response = session.post(
+        BUSYBAR_BASE_URL + path,
+        headers=busybar_headers,
+        params=params,
+        timeout=BUSYBAR_TIMEOUT_SECONDS,
+    )
+
+    response.raise_for_status()
+
+    if response.content:
+        return response.json()
+
+    return None
+
+
+# ============================================================
+# BUSY BAR PROFILE CONTROL
+# ============================================================
+
+def get_profile(slot):
+    return busybar_get(
+        f"/api/busy/profiles/{slot}"
+    )
+
+
+def configure_profile(slot, theme):
+    """
+    Configure an existing BUSY Bar slot with:
+
+      - requested theme
+      - INFINITE timer
+      - fresh profile timestamp
+
+    Existing title/id/settings are otherwise preserved.
+    """
+
+    profile = get_profile(slot)
+
+    old_theme = profile.get(
+        "busy_bar_settings", {}
+    ).get("theme")
+
+    old_timer = profile.get(
+        "timer_settings", {}
+    ).get("type")
+
+    log(
+        f"Configuring '{slot}' profile: "
+        f"{old_theme}/{old_timer} -> {theme}/INFINITE"
+    )
+
+    profile["timer_settings"] = {
+        "type": "INFINITE"
+    }
+
+    profile.setdefault(
+        "busy_bar_settings", {}
+    )
+
+    profile["busy_bar_settings"]["theme"] = theme
+
+    # IMPORTANT:
+    # Give every profile mutation a fresh timestamp.
+    profile["profile_timestamp_ms"] = int(
+        time.time() * 1000
+    )
+
+    result = busybar_put(
+        f"/api/busy/profiles/{slot}",
+        profile,
+    )
+
+    log(
+        f"Profile PUT result: {result}"
+    )
+
+    time.sleep(DEVICE_SETTLE_SECONDS)
+
+    # Verify that firmware actually accepted the profile update.
+    current = get_profile(slot)
+
+    actual_theme = current.get(
+        "busy_bar_settings", {}
+    ).get("theme")
+
+    actual_timer = current.get(
+        "timer_settings", {}
+    ).get("type")
+
+    if actual_theme != theme:
+        raise RuntimeError(
+            f"BUSY Bar did not apply theme "
+            f"'{theme}' to slot '{slot}'. "
+            f"Read-back theme is '{actual_theme}'."
+        )
+
+    if actual_timer != "INFINITE":
+        raise RuntimeError(
+            f"BUSY Bar did not apply INFINITE timer "
+            f"to slot '{slot}'. "
+            f"Read-back timer is '{actual_timer}'."
+        )
+
+    log(
+        f"Verified '{slot}': "
+        f"theme={actual_theme}, timer={actual_timer}"
+    )
+
+
+# ============================================================
+# VIRTUAL BUTTON CONTROL
+# ============================================================
+
+def press(key):
+    log(
+        f"BUSY Bar input: {key}"
+    )
+
+    result = busybar_post(
+        "/api/input",
+        params={
+            "key": key
+        },
+    )
+
+    log(
+        f"Input result: {result}"
+    )
+
+    time.sleep(DEVICE_SETTLE_SECONDS)
+
+
+def stop_current_display():
+    """
+    Equivalent to pressing OFF on the BUSY Bar.
+    """
+
+    press("off")
+
+
+def start_profile(slot):
+    """
+    Select a profile slot and then press START.
+
+    slot must be:
+      busy
+      custom
+    """
+
+    if slot not in ("busy", "custom"):
+        raise ValueError(
+            f"Unsupported BUSY Bar slot: {slot}"
+        )
+
+    press(slot)
+    press("start")
+
+
+# ============================================================
+# CLOUD STATUS
+# ============================================================
+
+def parse_until(value):
+    if not value:
         return None
 
-    if until.endswith("Z"):
-        until = until[:-1] + "+00:00"
-
-    return datetime.fromisoformat(until)
-
-
-def seconds_until(until):
-    end = parse_until(until)
-
-    if end is None:
-        return 0
-
-    now = datetime.now().astimezone()
-
-    remaining = int(
-        (end - now).total_seconds()
-    )
-
-    return max(0, remaining)
-
-
-# ----------------------------------------------------------------------
-# BUSY Bar profile helpers
-# ----------------------------------------------------------------------
-
-def get_profiles(bb):
-    """
-    Return the two profiles we use:
-
-      busy   -> confirmed Outlook meeting
-      custom -> tentative Outlook meeting
-    """
-
-    busy_profile = bb.busy_profile("busy")
-    custom_profile = bb.busy_profile("custom")
-
-    log(
-        f"BUSY profile: "
-        f"title='{busy_profile.title}', id='{busy_profile.id}'"
-    )
-
-    log(
-        f"CUSTOM profile: "
-        f"title='{custom_profile.title}', id='{custom_profile.id}'"
-    )
-
-    return busy_profile, custom_profile
-
-
-# ----------------------------------------------------------------------
-# BUSY Bar snapshot helpers
-# ----------------------------------------------------------------------
-
-def current_snapshot(bb):
-    return bb.busy_snapshot()
-
-
-def snapshot_description(snapshot):
-    state = snapshot.snapshot
-
-    if state.type == "NOT_STARTED":
-        return "idle"
-
-    if state.type == "SIMPLE":
-        return (
-            f"SIMPLE card={state.card_id}, "
-            f"remaining={state.time_left_ms // 1000}s, "
-            f"paused={state.is_paused}"
+    try:
+        # Python understands +00:00 more consistently than Z.
+        value = value.replace(
+            "Z",
+            "+00:00"
         )
 
-    if state.type == "INFINITE":
-        return (
-            f"INFINITE card={state.card_id}, "
-            f"paused={state.is_paused}"
-        )
+        return datetime.fromisoformat(value)
 
-    return state.type
+    except Exception:
+        return None
 
 
-# ----------------------------------------------------------------------
-# BUSY Bar state changes
-# ----------------------------------------------------------------------
-
-def set_idle(bb):
-    log("Setting BUSY Bar -> IDLE")
-
-    snapshot = types.BusySnapshot(
-        snapshot=types.BusySnapshotNotStarted(
-            type="NOT_STARTED"
-        ),
-        snapshot_timestamp_ms=int(time.time() * 1000),
+def get_cloud_status():
+    response = session.get(
+        STATUS_URL,
+        headers={
+            "Cache-Control": "no-cache"
+        },
+        timeout=STATUS_TIMEOUT_SECONDS,
     )
 
-    result = bb.busy_snapshot_set(snapshot)
+    response.raise_for_status()
 
-    log(f"Idle update result: {result}")
+    data = response.json()
 
+    status = str(
+        data.get("status", "free")
+    ).strip().lower()
 
-def set_timer(bb, profile, seconds, label):
-    milliseconds = seconds * 1000
-
-    log(
-        f"Setting BUSY Bar -> {label} "
-        f"for {seconds}s ({milliseconds} ms)"
+    until = parse_until(
+        data.get("until")
     )
 
-    snapshot = types.BusySnapshot(
-        snapshot=types.BusySnapshotSimple(
-            type="SIMPLE",
-            card_id=profile.id,
-            time_left_ms=milliseconds,
-            is_paused=False,
-        ),
-        snapshot_timestamp_ms=int(time.time() * 1000),
-    )
-
-    result = bb.busy_snapshot_set(snapshot)
-
-    log(f"{label} update result: {result}")
-
-
-# ----------------------------------------------------------------------
-# State comparison
-# ----------------------------------------------------------------------
-
-def timer_already_correct(
-    snapshot,
-    expected_profile_id,
-    expected_seconds,
-):
-    state = snapshot.snapshot
-
-    if state.type != "SIMPLE":
-        return False
-
-    if state.card_id != expected_profile_id:
-        return False
-
-    if state.is_paused:
-        return False
-
-    actual_seconds = state.time_left_ms // 1000
-
-    difference = abs(
-        actual_seconds - expected_seconds
-    )
-
-    log(
-        f"Existing timer remaining={actual_seconds}s, "
-        f"calendar expects={expected_seconds}s, "
-        f"difference={difference}s"
-    )
-
-    return difference <= TIMER_TOLERANCE_SECONDS
-
-
-# ----------------------------------------------------------------------
-# Synchronization
-# ----------------------------------------------------------------------
-
-def synchronize(
-    bb,
-    busy_profile,
-    custom_profile,
-):
-    cloud = get_cloudflare_status()
-
-    status = cloud.get("status", "unknown")
-    until = cloud.get("until")
-
-    log(
-        f"Calendar state={status}, "
-        f"until={until}"
-    )
-
-    snapshot = current_snapshot(bb)
-
-    log(
-        "BUSY Bar currently: "
-        + snapshot_description(snapshot)
-    )
-
-    # --------------------------------------------------------------
-    # FREE / UNKNOWN
-    # --------------------------------------------------------------
-
-    if status in ("free", "unknown"):
-        if snapshot.snapshot.type == "NOT_STARTED":
-            log(
-                "BUSY Bar already idle -- "
-                "no update required."
-            )
-        else:
-            set_idle(bb)
-
-        return
-
-    # --------------------------------------------------------------
-    # Validate active state
-    # --------------------------------------------------------------
-
-    if status not in (
+    if status not in {
+        "free",
         "busy",
         "tentative",
+        "ooo",
+    }:
+        log(
+            f"Unknown cloud status '{status}', "
+            f"treating as FREE."
+        )
+        status = "free"
+
+    # Optional safety net:
+    # If the event has expired but Cloudflare hasn't been
+    # refreshed yet, clear the bar.
+    if (
+        HONOR_UNTIL_TIMESTAMP
+        and status != "free"
+        and until is not None
     ):
-        log(
-            f"Unsupported calendar status: {status}"
-        )
-        return
+        now = datetime.now(timezone.utc)
 
-    remaining = seconds_until(until)
-
-    if remaining <= 0:
-        log(
-            "Meeting has expired -- "
-            "setting BUSY Bar idle."
-        )
-
-        if snapshot.snapshot.type != "NOT_STARTED":
-            set_idle(bb)
-
-        return
-
-    # --------------------------------------------------------------
-    # Pick profile
-    # --------------------------------------------------------------
-
-    if status == "busy":
-        profile = busy_profile
-        label = "MEETING"
-
-    else:
-        profile = custom_profile
-        label = "TENTATIVE"
-
-    # --------------------------------------------------------------
-    # Don't keep resetting the BUSY Bar timer.
-    # --------------------------------------------------------------
-
-    if timer_already_correct(
-        snapshot,
-        profile.id,
-        remaining,
-    ):
-        log(
-            f"{label} already programmed correctly -- "
-            "leaving BUSY Bar timer alone."
-        )
-        return
-
-    # --------------------------------------------------------------
-    # Program new/changed meeting
-    # --------------------------------------------------------------
-
-    set_timer(
-        bb,
-        profile,
-        remaining,
-        label,
-    )
-
-
-# ----------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------
-
-def main():
-    if not CLOUDFLARE_STATUS_URL:
-        print(
-            "ERROR: CLOUDFLARE_STATUS_URL "
-            "environment variable is required."
-        )
-        sys.exit(1)
-
-    log(
-        "Outlook -> Cloudflare -> "
-        "BUSY Bar controller starting"
-    )
-
-    log(f"BUSY Bar IP: {BUSYBAR_IP}")
-    log(f"Poll interval: {POLL_SECONDS}s")
-
-    bb = None
-    busy_profile = None
-    custom_profile = None
-
-    while True:
-        try:
-            if bb is None:
-                bb = connect_busybar()
-
-                busy_profile, custom_profile = (
-                    get_profiles(bb)
-                )
-
-            synchronize(
-                bb,
-                busy_profile,
-                custom_profile,
+        if until <= now:
+            log(
+                f"Cloud state '{status}' expired at "
+                f"{until.isoformat()}, treating as FREE."
             )
 
-        except KeyboardInterrupt:
-            log("Stopping.")
-            break
+            status = "free"
+
+    return status, until, data
+
+    # ============================================================
+# STATE MACHINE
+# ============================================================
+
+def activate_state(state):
+    """
+    Translate calendar state into native BUSY Bar behavior.
+    """
+
+    log(
+        f"Activating state: {state.upper()}"
+    )
+
+    # Always leave the currently-running BUSY/CUSTOM session
+    # before modifying profiles or switching modes.
+    stop_current_display()
+
+    if state == "free":
+        log(
+            "BUSY Bar is FREE."
+        )
+        return
+
+    if state == "busy":
+        configure_profile(
+            BUSY_SLOT,
+            BUSY_THEME,
+        )
+
+        start_profile(
+            BUSY_SLOT
+        )
+
+        return
+
+    if state == "tentative":
+        configure_profile(
+            TENTATIVE_SLOT,
+            TENTATIVE_THEME,
+        )
+
+        start_profile(
+            TENTATIVE_SLOT
+        )
+
+        return
+
+    if state == "ooo":
+        configure_profile(
+            OOO_SLOT,
+            OOO_THEME,
+        )
+
+        start_profile(
+            OOO_SLOT
+        )
+
+        return
+
+    raise ValueError(
+        f"Unexpected state: {state}"
+    )
+
+    # ============================================================
+# MAIN LOOP
+# ============================================================
+
+def main():
+    log("BUSY Bar calendar controller starting.")
+
+    log(
+        f"BUSY Bar: {BUSYBAR_BASE_URL}"
+    )
+
+    log(
+        f"Cloud status: {STATUS_URL}"
+    )
+
+    log(
+        "Theme mapping: "
+        f"busy={BUSY_THEME}, "
+        f"tentative={TENTATIVE_THEME}, "
+        f"ooo={OOO_THEME}"
+    )
+
+    current_state = None
+
+    while True:
+
+        try:
+            new_state, until, raw = get_cloud_status()
+
+            until_text = (
+                until.isoformat()
+                if until
+                else "none"
+            )
+
+            log(
+                f"Cloud status: "
+                f"{new_state}, until={until_text}"
+            )
+
+            # The important bit:
+            #
+            # Do NOT continuously reprogram the BUSY Bar.
+            # Only touch it when the calendar state changes.
+            if new_state != current_state:
+
+                log(
+                    f"State transition: "
+                    f"{current_state} -> {new_state}"
+                )
+
+                activate_state(
+                    new_state
+                )
+
+                # Only record the new state AFTER all BUSY Bar
+                # operations completed successfully.
+                current_state = new_state
+
+            else:
+                log(
+                    f"No state change ({current_state})."
+                )
+
+        except requests.RequestException as exc:
+            log(
+                f"Network/API error: {exc}"
+            )
 
         except Exception as exc:
             log(
-                f"ERROR: {type(exc).__name__}: "
-                f"{exc}"
+                f"ERROR: {exc}"
             )
 
-            #
-            # Force reconnect next cycle.
-            #
-            bb = None
-            busy_profile = None
-            custom_profile = None
-
-        time.sleep(POLL_SECONDS)
+        time.sleep(
+            POLL_INTERVAL_SECONDS
+        )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except KeyboardInterrupt:
+        log(
+            "Controller stopped."
+        )
+
+        sys.exit(0)
