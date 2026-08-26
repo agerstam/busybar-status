@@ -2,6 +2,35 @@
 
 Local web controller for mirroring Outlook availability from Cloudflare to a BUSY Bar.
 
+## Install on macOS
+
+Install it as a per-user background service:
+
+```bash
+make install
+```
+
+The installer builds a standalone `~/Applications/BUSY Bar Status.app`, starts the
+controller, registers it to start whenever you log in, and opens
+<http://127.0.0.1:8765>. No terminal needs to remain open. Logs are written to
+`~/Library/Logs/BusyBarStatus`; settings and preview caches live in
+`~/Library/Application Support/BusyBarStatus`.
+
+To stop it and remove it from login startup while preserving settings and logs:
+
+```bash
+make uninstall
+```
+
+Run the installer again after moving the project directory because the LaunchAgent
+stores its absolute path.
+
+On first installation, allow **BUSY Bar Status** to access the local network when
+macOS asks. You can change this later under **System Settings → Privacy & Security
+→ Local Network**.
+
+## Run for development
+
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt

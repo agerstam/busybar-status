@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Local BUSY Bar controller and web interface."""
-import argparse, base64, ipaddress, json, os, re, struct, threading, time
+import argparse, base64, ipaddress, json, os, re, struct, sys, threading, time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -8,7 +8,10 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 STATUS_URL = "https://busybar-status.matsagerstam.workers.dev/status"
-PREVIEW_DIR = Path(__file__).with_name(".preview-cache")
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+DATA_DIR = (Path.home() / "Library/Application Support/BusyBarStatus"
+            if getattr(sys, "frozen", False) else Path(__file__).parent)
+PREVIEW_DIR = DATA_DIR / ".preview-cache"
 DEFAULTS = {"work_sync_enabled": True, "device_ip": "10.0.4.20",
             "poll_interval_seconds": 30, "sound_enabled": True, "sound_volume": 50,
             "state_cards": {"busy": "theme:meeting", "tentative": "theme:booked", "ooo": "theme:keep_out"}}
@@ -94,6 +97,9 @@ class Device:
     def display(self, card, seconds=None):
         self.clear_draws()
         if card.startswith("custom:"):
+            # Canvas cannot preempt a running BUSY snapshot on firmware 1.1.1,
+            # even at the documented maximum priority.
+            self.stop_busy()
             name = card.removeprefix("custom:")
             available = {x["name"] for x in self.listing("/ext/user_assets/draw_tool") if x["type"] == "file"}
             if name not in available or not name.lower().endswith(".png"): raise ValueError("Unknown custom image")
@@ -123,6 +129,7 @@ class Device:
         if not isinstance(text, str) or not text or len(text) > 120 or any(ord(c) < 32 or ord(c) > 126 for c in text):
             raise ValueError("Running text must be 1–120 printable ASCII characters; emoji are not supported")
         self.clear_draws()
+        self.stop_busy()
         self.request("POST", "/api/display/draw", json={"application_name": "busybar_status", "priority": 100,
             "elements": [
                 {"id": "background", "type": "rectangle", "x": 0, "y": 0, "width": 72, "height": 16,
@@ -136,9 +143,19 @@ class Device:
         for app in ("draw_tool", "busybar_status"):
             self.request("DELETE", "/api/display/draw", params={"application_name": app})
 
+    def stop_busy(self):
+        current = self.request("GET", "/api/busy/snapshot").json()
+        settings = current.get("snapshot", {}).get("busy_bar_settings")
+        if not settings:
+            settings = self.profile("busy")["busy_bar_settings"]
+        self.request("PUT", "/api/busy/snapshot", json={
+            "snapshot": {"type": "NOT_STARTED", "busy_bar_settings": settings},
+            "snapshot_timestamp_ms": int(time.time() * 1000),
+        })
+
     def stop(self):
         self.clear_draws()
-        self.request("POST", "/api/input", params={"key": "off"})
+        self.stop_busy()
     def volume(self): return int(self.request("GET", "/api/audio/volume").json()["volume"])
     def set_volume(self, volume): self.request("POST", "/api/audio/volume", params={"volume": volume, "silent": 1})
     def asset(self, name):
@@ -306,8 +323,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc: self.send_json(400,{"error":str(exc)})
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument("--host",default="127.0.0.1"); p.add_argument("--port",type=int,default=8765); p.add_argument("--config",type=Path,default=Path(__file__).with_name("config.json")); a=p.parse_args()
-    controller=Controller(Config(a.config)); Handler.controller=controller; Handler.web=Path(__file__).with_name("web")
+    p=argparse.ArgumentParser(); p.add_argument("--host",default="127.0.0.1"); p.add_argument("--port",type=int,default=8765); p.add_argument("--config",type=Path,default=DATA_DIR/"config.json"); a=p.parse_args()
+    a.config.parent.mkdir(parents=True,exist_ok=True)
+    controller=Controller(Config(a.config)); Handler.controller=controller; Handler.web=RESOURCE_DIR/"web"
     threading.Thread(target=controller.run,daemon=True).start(); server=ThreadingHTTPServer((a.host,a.port),Handler)
     log(f"Web interface: http://{a.host}:{a.port}")
     try: server.serve_forever()
