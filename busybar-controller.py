@@ -39,8 +39,15 @@ class Config:
         if path.exists():
             try: saved = json.loads(path.read_text())
             except (OSError, ValueError) as exc: log(f"Ignoring invalid config: {exc}")
+        if not isinstance(saved, dict):
+            log("Ignoring invalid config: expected a JSON object")
+            saved = {}
         merged = {**DEFAULTS, **saved}
-        merged["state_cards"] = {**DEFAULTS["state_cards"], **saved.get("state_cards", {})}
+        saved_cards = saved.get("state_cards", {})
+        if not isinstance(saved_cards, dict):
+            log("Ignoring invalid state_cards config")
+            saved_cards = {}
+        merged["state_cards"] = {**DEFAULTS["state_cards"], **saved_cards}
         self.value = self.validate(merged)
 
     @staticmethod
@@ -232,7 +239,7 @@ class Controller:
         # Manual durations are managed here so sound behavior is identical for
         # native themes and Draw Tool images and never changes global volume.
         if text: self.device().display_text(text, foreground, background); card = "text"
-        else: self.device().display(card)
+        else: self.device().display(card, seconds)
         with self.lock:
             self._cancel_manual_locked()
             generation = self.manual_generation
@@ -310,10 +317,14 @@ class Controller:
 
 class Handler(BaseHTTPRequestHandler):
     controller, web = None, None
+    max_body_bytes = 64 * 1024
     def log_message(self, fmt, *args): log("Web: " + fmt % args)
     def send_json(self, code, value):
         body=json.dumps(value).encode(); self.send_response(code); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
-    def body(self): return json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))) or b"{}")
+    def body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length < 0 or length > self.max_body_bytes: raise ValueError("Request body is too large")
+        return json.loads(self.rfile.read(length) or b"{}")
     def do_GET(self):
         p=urlparse(self.path)
         try:

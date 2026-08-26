@@ -1,7 +1,6 @@
 #!/bin/bash
 
 WORKER_URL="https://busybar-status.matsagerstam.workers.dev/update"
-TOKEN="81464ea31125cec489cd8bfa473a92df9096a680316de05e62bce4d1993a6ff8"
 
 STATUS="$1"
 MINUTES="${2:-30}"
@@ -39,6 +38,11 @@ case "$STATUS" in
     ;;
 esac
 
+if [ -z "${BUSYBAR_WORKER_TOKEN:-}" ]; then
+  echo "Set BUSYBAR_WORKER_TOKEN before running this script." >&2
+  exit 1
+fi
+
 UPDATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 echo
@@ -48,10 +52,10 @@ echo "  until   = ${UNTIL:-none}"
 echo "  updated = $UPDATED"
 echo
 
-curl -sS \
+curl -sS --fail \
   -X POST \
   "$WORKER_URL" \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $BUSYBAR_WORKER_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{
     \"status\": \"$STATUS\",
