@@ -24,7 +24,12 @@ def parse_until(value):
     if not isinstance(value, str) or not value.strip(): return None
     try:
         result = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        return (result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result).astimezone(timezone.utc)
+        # Outlook's Cloudflare payload currently sends `until` in local wall
+        # time without an offset. Treat a naive value as this controller's local
+        # timezone; treating it as UTC makes Pacific events expire hours early.
+        if result.tzinfo is None:
+            result = result.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return result.astimezone(timezone.utc)
     except ValueError: return None
 
 class Config:
