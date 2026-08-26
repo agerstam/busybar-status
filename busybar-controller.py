@@ -163,6 +163,18 @@ class Device:
         self.stop_busy()
     def volume(self): return int(self.request("GET", "/api/audio/volume").json()["volume"])
     def set_volume(self, volume): self.request("POST", "/api/audio/volume", params={"volume": volume, "silent": 1})
+    def info(self):
+        status = self.request("GET", "/api/status").json()
+        return {
+            "api_version": status.get("system", {}).get("api_semver"),
+            "firmware_version": status.get("firmware", {}).get("version"),
+            "firmware_build": status.get("firmware", {}).get("build_date"),
+            "serial_number": status.get("device", {}).get("serial_number"),
+            "uptime": status.get("system", {}).get("uptime"),
+            "battery_charge": status.get("power", {}).get("battery_charge"),
+            "power_state": status.get("power", {}).get("state"),
+            "transport": self.request("GET", "/api/transport").json().get("type"),
+        }
     def asset(self, name):
         available = {x["name"] for x in self.listing("/ext/user_assets/draw_tool") if x["type"] == "file"}
         if name not in available or not name.lower().endswith(".png"): raise ValueError("Unknown custom image")
@@ -183,7 +195,7 @@ class Device:
 class Controller:
     def __init__(self, config):
         self.config, self.lock, self.wake = config, threading.RLock(), threading.Event()
-        self.runtime = {"cloud_status": None, "cloud_until": None, "displayed_slot": None,
+        self.runtime = {"cloud_status": None, "cloud_until": None, "cloud_updated": None, "displayed_slot": None,
                         "manual_ends_at": None, "last_poll_at": None, "last_error": None}
         self.force, self.manual_timer, self.manual_generation = True, None, 0
 
@@ -248,6 +260,12 @@ class Controller:
         self.device().stop()
         with self.lock: self.runtime.update(displayed_slot=None, last_error=None)
 
+    def force_sync(self):
+        if not self.config.get()["work_sync_enabled"]:
+            raise PermissionError("Turn auto refresh on before forcing synchronization")
+        with self.lock: self.force = True
+        self.poll()
+
     def capture_previews(self):
         if self.config.get()["work_sync_enabled"]:
             raise PermissionError("Turn work sync off before capturing theme previews")
@@ -277,6 +295,7 @@ class Controller:
             with self.lock: self.runtime["displayed_slot"], self.force = slot, False
             log(f"Applied {status}: {slot or 'display off'}")
         with self.lock: self.runtime.update(cloud_status=status, cloud_until=until.isoformat() if until else None,
+                                           cloud_updated=data.get("updated"),
                                            last_poll_at=datetime.now(timezone.utc).isoformat(), last_error=None)
 
     def run(self):
@@ -301,6 +320,7 @@ class Handler(BaseHTTPRequestHandler):
             if p.path == "/":
                 body=(self.web/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
             elif p.path == "/api/app/state": self.send_json(200,self.controller.state())
+            elif p.path == "/api/app/about": self.send_json(200,self.controller.device().info())
             elif p.path == "/api/app/screen":
                 body=self.controller.device().screen(int(parse_qs(p.query).get("display",[0])[0])); self.send_response(200); self.send_header("Content-Type","image/bmp"); self.send_header("Cache-Control","no-store"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
             elif p.path == "/api/app/asset":
@@ -322,6 +342,7 @@ class Handler(BaseHTTPRequestHandler):
                 b=self.body(); seconds=b.get("duration_seconds"); self.controller.manual(str(b.get("slot","")),int(seconds) if seconds not in (None,"") else None,b.get("text"),b.get("foreground","#FFFFFF"),b.get("background","#000000"))
             elif self.path == "/api/app/stop": self.controller.stop()
             elif self.path == "/api/app/capture-previews": self.controller.capture_previews()
+            elif self.path == "/api/app/sync": self.controller.force_sync()
             else: return self.send_json(404,{"error":"Not found"})
             self.send_json(200,{"ok":True})
         except PermissionError as exc: self.send_json(409,{"error":str(exc)})
