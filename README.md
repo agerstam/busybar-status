@@ -142,6 +142,18 @@ supports scrolling text with foreground and background colors. The device API ac
 1–120 printable ASCII characters; its bitmap font does not support emoji or other
 Unicode characters.
 
+The Free mapping defaults to **Display off**, but it can use any built-in or custom
+card instead. While work synchronization is enabled, **Show time until next change**
+can alternate the mapped card with a concise relative message such as `Free in 45m`,
+`Free in 2h 5m`, or `Busy in 20m`. The interval is configurable from 5 to 300 seconds,
+and both settings are persisted with the other controller configuration.
+
+The dashboard's **On device now** panel samples the real front display every 15
+seconds, including changes made from the device or mobile app. Screenshots are
+coalesced by the controller for 12 seconds to avoid unnecessary device API traffic.
+Automatic dashboard updates preserve configuration edits until they are saved or the
+page is reloaded.
+
 Muting stores the current non-zero volume so enabling sound restores it. Built-in
 themes use a device-native animation format. With work sync off, use **Capture real
 theme previews** once to render each theme on the device and cache accurate thumbnails.
