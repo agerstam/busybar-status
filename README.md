@@ -4,6 +4,21 @@ Local web controller for mirroring availability from a cloud status provider to 
 BUSY Bar. The included configuration reads Outlook-derived presence from a Cloudflare
 Worker, but any service that implements the documented JSON contract can be used.
 
+## About
+
+BUSY Bar Status is an independent, local controller created to turn calendar or other
+cloud-provided availability into a clear visual presence signal. It runs on a Mac,
+drives a [BUSY Bar](https://busy.app/products/busy-bar) through its HTTP API, and
+provides a local web interface for synchronization, card mappings, manual displays,
+device settings, and live previews.
+
+This repository includes the Python controller, web UI, macOS installer, and the
+documented status-provider JSON contract. It does not include the BUSY Bar hardware,
+firmware, or official BUSY applications, and it does not create the Outlook calendar
+integration or host a cloud provider for you. Those status producers are separate and
+can be replaced with any service that follows the API contract below. This project is
+not affiliated with or endorsed by the BUSY Bar manufacturer.
+
 ## Requirements
 
 - macOS with Python 3 and `make`
