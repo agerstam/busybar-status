@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Local BUSY Bar controller and web interface."""
-import argparse, base64, ipaddress, json, os, re, struct, threading, time
+import argparse, base64, ipaddress, json, os, re, struct, sys, threading, time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -8,20 +8,48 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 STATUS_URL = "https://busybar-status.matsagerstam.workers.dev/status"
-PREVIEW_DIR = Path(__file__).with_name(".preview-cache")
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+DATA_DIR = (Path.home() / "Library/Application Support/BusyBarStatus"
+            if getattr(sys, "frozen", False) else Path(__file__).parent)
+PREVIEW_DIR = DATA_DIR / ".preview-cache"
+PREVIEW_COLOR_MARKER = PREVIEW_DIR / ".bgr888-v2"
+REMAINING_BACKGROUND = RESOURCE_DIR / "web/assets/remaining-v2.png"
+ASSET_UPLOAD_LOCK, ASSET_UPLOADS = threading.Lock(), set()
 DEFAULTS = {"work_sync_enabled": True, "device_ip": "10.0.4.20",
             "poll_interval_seconds": 30, "sound_enabled": True, "sound_volume": 50,
-            "state_cards": {"busy": "theme:meeting", "tentative": "theme:booked", "ooo": "theme:keep_out"}}
+            "show_remaining_enabled": False, "remaining_interval_seconds": 15,
+            "state_cards": {"busy": "theme:meeting", "tentative": "theme:booked",
+                            "ooo": "theme:keep_out", "free": "off"}}
 SLOTS = {"busy", "custom"}
 
 def log(message):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
 
+def migrate_preview_colors():
+    """Correct previews captured before /api/screen was identified as BGR888."""
+    if PREVIEW_COLOR_MARKER.exists() or not PREVIEW_DIR.exists(): return
+    converted = 0
+    for path in PREVIEW_DIR.glob("*.bmp"):
+        data = bytearray(path.read_bytes())
+        if len(data) < 54 or data[:2] != b"BM" or struct.unpack_from("<H", data, 28)[0] != 24: continue
+        offset = struct.unpack_from("<I", data, 10)[0]
+        for index in range(offset, len(data) - 2, 3):
+            data[index], data[index + 2] = data[index + 2], data[index]
+        temp = path.with_suffix(".bmp.tmp"); temp.write_bytes(data); temp.replace(path)
+        converted += 1
+    PREVIEW_COLOR_MARKER.write_text("BGR888 previews\n")
+    if converted: log(f"Corrected color channels in {converted} cached theme previews")
+
 def parse_until(value):
     if not isinstance(value, str) or not value.strip(): return None
     try:
         result = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        return (result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result).astimezone(timezone.utc)
+        # Outlook's Cloudflare payload currently sends `until` in local wall
+        # time without an offset. Treat a naive value as this controller's local
+        # timezone; treating it as UTC makes Pacific events expire hours early.
+        if result.tzinfo is None:
+            result = result.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return result.astimezone(timezone.utc)
     except ValueError: return None
 
 class Config:
@@ -31,26 +59,39 @@ class Config:
         if path.exists():
             try: saved = json.loads(path.read_text())
             except (OSError, ValueError) as exc: log(f"Ignoring invalid config: {exc}")
+        if not isinstance(saved, dict):
+            log("Ignoring invalid config: expected a JSON object")
+            saved = {}
         merged = {**DEFAULTS, **saved}
-        merged["state_cards"] = {**DEFAULTS["state_cards"], **saved.get("state_cards", {})}
+        saved_cards = saved.get("state_cards", {})
+        if not isinstance(saved_cards, dict):
+            log("Ignoring invalid state_cards config")
+            saved_cards = {}
+        merged["state_cards"] = {**DEFAULTS["state_cards"], **saved_cards}
         self.value = self.validate(merged)
 
     @staticmethod
     def validate(c):
         ipaddress.ip_address(str(c["device_ip"])); interval = int(c["poll_interval_seconds"])
         if not 5 <= interval <= 3600: raise ValueError("Poll interval must be 5–3600 seconds")
+        remaining_interval = int(c.get("remaining_interval_seconds", 15))
+        if not 5 <= remaining_interval <= 300: raise ValueError("Time remaining interval must be 5–300 seconds")
         mappings = c["state_cards"]
         # Migrate configuration written by the first UI prototype.
         legacy = {"busy": "theme:meeting", "custom": "theme:booked"}
-        mappings = {s: legacy.get(mappings.get(s), mappings.get(s)) for s in ("busy", "tentative", "ooo")}
-        if any(not isinstance(mappings[s], str) or not mappings[s].startswith(("theme:", "custom:")) for s in mappings):
+        mappings = {s: legacy.get(mappings.get(s), mappings.get(s)) for s in ("busy", "tentative", "ooo", "free")}
+        if any(not isinstance(mappings[s], str) or
+               (not mappings[s].startswith(("theme:", "custom:")) and not (s == "free" and mappings[s] == "off"))
+               for s in mappings):
             raise ValueError("Invalid state card")
         volume = int(c.get("sound_volume", 50))
         if not 1 <= volume <= 100: raise ValueError("Saved sound volume must be 1–100")
         return {"work_sync_enabled": bool(c["work_sync_enabled"]), "device_ip": str(c["device_ip"]),
                 "poll_interval_seconds": interval,
                 "sound_enabled": bool(c.get("sound_enabled", True)), "sound_volume": volume,
-                "state_cards": {s: mappings[s] for s in ("busy", "tentative", "ooo")}}
+                "show_remaining_enabled": bool(c.get("show_remaining_enabled", False)),
+                "remaining_interval_seconds": remaining_interval,
+                "state_cards": {s: mappings[s] for s in ("busy", "tentative", "ooo", "free")}}
 
     def get(self):
         with self.lock: return json.loads(json.dumps(self.value))
@@ -58,7 +99,8 @@ class Config:
     def update(self, changes):
         with self.lock:
             candidate = self.get()
-            for key in ("work_sync_enabled", "device_ip", "poll_interval_seconds", "sound_enabled", "sound_volume"):
+            for key in ("work_sync_enabled", "device_ip", "poll_interval_seconds", "sound_enabled", "sound_volume",
+                        "show_remaining_enabled", "remaining_interval_seconds"):
                 if key in changes: candidate[key] = changes[key]
             if "state_cards" in changes: candidate["state_cards"].update(changes["state_cards"])
             self.value = self.validate(candidate)
@@ -94,6 +136,9 @@ class Device:
     def display(self, card, seconds=None):
         self.clear_draws()
         if card.startswith("custom:"):
+            # Canvas cannot preempt a running BUSY snapshot on firmware 1.1.1,
+            # even at the documented maximum priority.
+            self.stop_busy()
             name = card.removeprefix("custom:")
             available = {x["name"] for x in self.listing("/ext/user_assets/draw_tool") if x["type"] == "file"}
             if name not in available or not name.lower().endswith(".png"): raise ValueError("Unknown custom image")
@@ -123,24 +168,78 @@ class Device:
         if not isinstance(text, str) or not text or len(text) > 120 or any(ord(c) < 32 or ord(c) > 126 for c in text):
             raise ValueError("Running text must be 1–120 printable ASCII characters; emoji are not supported")
         self.clear_draws()
+        self.stop_busy()
+        elements = [{"id": "background", "type": "rectangle", "x": 0, "y": 0, "width": 72, "height": 16,
+                     "fill": "solid", "fill_colors": [self.color(background)], "border_width": 0,
+                     "display": "front", "timeout": 0}]
+        elements.append({"id": "message", "type": "text", "text": text, "font": "normal", "color": self.color(foreground),
+                         "x": 0, "y": 8, "align": "mid_left", "width": 72, "scroll_rate": 600,
+                         "scroll_start_delay": 500, "scroll_repeat_delay": 1000, "display": "front", "timeout": 0})
         self.request("POST", "/api/display/draw", json={"application_name": "busybar_status", "priority": 100,
-            "elements": [
-                {"id": "background", "type": "rectangle", "x": 0, "y": 0, "width": 72, "height": 16,
-                 "fill": "solid", "fill_colors": [self.color(background)], "border_width": 0, "display": "front", "timeout": 0},
-                {"id": "message", "type": "text", "text": text, "font": "normal", "color": self.color(foreground),
-                 "x": 0, "y": 8, "align": "mid_left", "width": 72, "scroll_rate": 600,
-                 "scroll_start_delay": 500, "scroll_repeat_delay": 1000, "display": "front", "timeout": 0}
-            ]})
+                                                          "elements": elements})
+
+    def display_remaining_text(self, text):
+        if not isinstance(text, str) or not text or len(text) > 120 or any(ord(c) < 32 or ord(c) > 126 for c in text):
+            raise ValueError("Time remaining text must be printable ASCII")
+        with ASSET_UPLOAD_LOCK:
+            if self.url not in ASSET_UPLOADS:
+                try:
+                    stored = self.listing("/ext/user_assets/busybar_status")
+                except requests.HTTPError as exc:
+                    if exc.response.status_code != 400: raise
+                    stored = []
+                if REMAINING_BACKGROUND.name not in {item["name"] for item in stored if item["type"] == "file"}:
+                    self.request("POST", "/api/assets/upload",
+                                 params={"application_name": "busybar_status", "file": REMAINING_BACKGROUND.name},
+                                 data=REMAINING_BACKGROUND.read_bytes(), headers={"Content-Type": "application/octet-stream"})
+                ASSET_UPLOADS.add(self.url)
+        self.clear_draws()
+        self.stop_busy()
+        try:
+            self.request("POST", "/api/display/draw", json={"application_name": "busybar_status", "priority": 100,
+                "elements": [
+                    {"id": "remaining_background", "type": "image", "path": REMAINING_BACKGROUND.name,
+                     "x": 0, "y": 0, "display": "front", "timeout": 0},
+                    {"id": "remaining_message", "type": "text", "text": text, "font": "normal", "color": "#FFFFFFFF",
+                     "x": 36, "y": 8, "align": "center", "display": "front", "timeout": 0}
+                ]})
+        except Exception:
+            # If the device lost its app assets after a reset, upload again on
+            # the next rotation attempt instead of keeping a stale cache entry.
+            with ASSET_UPLOAD_LOCK: ASSET_UPLOADS.discard(self.url)
+            raise
 
     def clear_draws(self):
         for app in ("draw_tool", "busybar_status"):
             self.request("DELETE", "/api/display/draw", params={"application_name": app})
 
+    def stop_busy(self):
+        current = self.request("GET", "/api/busy/snapshot").json()
+        settings = current.get("snapshot", {}).get("busy_bar_settings")
+        if not settings:
+            settings = self.profile("busy")["busy_bar_settings"]
+        self.request("PUT", "/api/busy/snapshot", json={
+            "snapshot": {"type": "NOT_STARTED", "busy_bar_settings": settings},
+            "snapshot_timestamp_ms": int(time.time() * 1000),
+        })
+
     def stop(self):
         self.clear_draws()
-        self.request("POST", "/api/input", params={"key": "off"})
+        self.stop_busy()
     def volume(self): return int(self.request("GET", "/api/audio/volume").json()["volume"])
     def set_volume(self, volume): self.request("POST", "/api/audio/volume", params={"volume": volume, "silent": 1})
+    def info(self):
+        status = self.request("GET", "/api/status").json()
+        return {
+            "api_version": status.get("system", {}).get("api_semver"),
+            "firmware_version": status.get("firmware", {}).get("version"),
+            "firmware_build": status.get("firmware", {}).get("build_date"),
+            "serial_number": status.get("device", {}).get("serial_number"),
+            "uptime": status.get("system", {}).get("uptime"),
+            "battery_charge": status.get("power", {}).get("battery_charge"),
+            "power_state": status.get("power", {}).get("state"),
+            "transport": self.request("GET", "/api/transport").json().get("type"),
+        }
     def asset(self, name):
         available = {x["name"] for x in self.listing("/ext/user_assets/draw_tool") if x["type"] == "file"}
         if name not in available or not name.lower().endswith(".png"): raise ValueError("Unknown custom image")
@@ -149,23 +248,39 @@ class Device:
         raw = base64.b64decode(self.request("GET", "/api/screen", params={"display": display}).content)
         width, height = 72, 16
         if len(raw) != width * height * 3: raise ValueError("Unexpected screen frame size")
-        # API v25 returns base64 RGB888 pixels despite declaring image/bmp.
+        # API v25 returns base64 BGR888 pixels despite declaring image/bmp.
+        # A 24-bit BMP also stores pixels as BGR, so preserve each triplet and
+        # only reverse the row order required by the BMP bottom-up layout.
         rows = [raw[y*width*3:(y+1)*width*3] for y in range(height)]
-        pixels = b"".join(
-            bytes((row[i+2], row[i+1], row[i]))
-            for row in reversed(rows) for i in range(0, len(row), 3)
-        )
+        pixels = b"".join(reversed(rows))
         return (b"BM" + struct.pack("<IHHI", 54+len(pixels), 0, 0, 54) +
                 struct.pack("<IIIHHIIIIII", 40, width, height, 1, 24, 0, len(pixels), 2835, 2835, 0, 0) + pixels)
 
 class Controller:
     def __init__(self, config):
-        self.config, self.lock, self.wake = config, threading.RLock(), threading.Event()
-        self.runtime = {"cloud_status": None, "cloud_until": None, "displayed_slot": None,
-                        "manual_ends_at": None, "last_poll_at": None, "last_error": None}
+        self.config, self.lock, self.device_lock, self.wake = config, threading.RLock(), threading.RLock(), threading.Event()
+        self.runtime = {"cloud_status": None, "cloud_until": None, "cloud_updated": None, "displayed_slot": None,
+                        "manual_ends_at": None, "remaining_phase": None, "remaining_next_at": None,
+                        "last_poll_at": None, "last_error": None}
         self.force, self.manual_timer, self.manual_generation = True, None, 0
+        self.remaining_timer, self.remaining_generation = None, 0
+        self.screen_cache = {}
 
     def device(self): return Device(self.config.get()["device_ip"])
+    def screen(self, display=0, force=False):
+        now, key = time.monotonic(), (self.config.get()["device_ip"], display)
+        with self.lock:
+            cached = self.screen_cache.get(key)
+            if not force and cached and now - cached[0] < 12: return cached[1]
+        with self.device_lock:
+            # Coalesce simultaneous UI requests so the device is sampled at
+            # most once per cache window unless the user explicitly refreshes.
+            with self.lock:
+                cached = self.screen_cache.get(key)
+                if not force and cached and time.monotonic() - cached[0] < 12: return cached[1]
+            body = self.device().screen(display)
+            with self.lock: self.screen_cache[key] = (time.monotonic(), body)
+            return body
     def state(self):
         with self.lock: result = {"config": self.config.get(), "runtime": self.runtime.copy()}
         try: result.update(cards=self.device().cards(), device_volume=self.device().volume(), device_error=None)
@@ -182,8 +297,13 @@ class Controller:
             device.set_volume(int(changes.get("sound_volume", old["sound_volume"])) if enabled else 0)
         new = self.config.update(changes)
         with self.lock:
-            if old["device_ip"] != new["device_ip"] or old["state_cards"] != new["state_cards"] or not old["work_sync_enabled"]: self.force = True
-            if old["work_sync_enabled"] and not new["work_sync_enabled"]: self.runtime.update(cloud_status=None, cloud_until=None)
+            if (old["device_ip"] != new["device_ip"] or old["state_cards"] != new["state_cards"] or
+                    old["show_remaining_enabled"] != new["show_remaining_enabled"] or
+                    old["remaining_interval_seconds"] != new["remaining_interval_seconds"] or
+                    not old["work_sync_enabled"]): self.force = True
+            if old["work_sync_enabled"] and not new["work_sync_enabled"]:
+                self._cancel_remaining_locked()
+                self.runtime.update(cloud_status=None, cloud_until=None)
             if not old["work_sync_enabled"] and new["work_sync_enabled"]: self._cancel_manual_locked()
         self.wake.set(); return new
 
@@ -193,12 +313,81 @@ class Controller:
         self.manual_timer = None
         self.runtime["manual_ends_at"] = None
 
+    def _cancel_remaining_locked(self):
+        self.remaining_generation += 1
+        if self.remaining_timer: self.remaining_timer.cancel()
+        self.remaining_timer = None
+        self.runtime.update(remaining_phase=None, remaining_next_at=None)
+
+    @staticmethod
+    def _remaining_text(until, status):
+        seconds = max(0, int((until - datetime.now(timezone.utc)).total_seconds()))
+        minutes = (seconds + 59) // 60
+        destination = "Busy" if status == "free" else "Free"
+        if minutes <= 0: return f"{destination} soon"
+        hours, minutes = divmod(minutes, 60)
+        return (f"{destination} in {hours}h {minutes}m" if hours and minutes else
+                (f"{destination} in {hours}h" if hours else f"{destination} in {minutes}m"))
+
+    def _display_status_card(self, status, config):
+        slot = config["state_cards"][status]
+        if slot == "off": self.device().stop(); return None
+        self.device().display(slot); return slot
+
+    def _schedule_remaining_locked(self, generation, delay):
+        next_at = datetime.now(timezone.utc).timestamp() + delay
+        self.runtime["remaining_next_at"] = datetime.fromtimestamp(next_at, timezone.utc).isoformat()
+        self.remaining_timer = threading.Timer(delay, self._remaining_tick, args=(generation,))
+        self.remaining_timer.daemon = True
+        self.remaining_timer.start()
+
+    def _restart_remaining_locked(self, status, until):
+        self._cancel_remaining_locked()
+        c = self.config.get()
+        if not c["show_remaining_enabled"] or not until: return
+        generation = self.remaining_generation
+        self.runtime["remaining_phase"] = "card"
+        self._schedule_remaining_locked(generation, c["remaining_interval_seconds"])
+
+    def _remaining_tick(self, generation):
+        try:
+            with self.device_lock:
+                with self.lock:
+                    c = self.config.get(); status = self.runtime["cloud_status"]
+                    until = parse_until(self.runtime["cloud_until"])
+                    if (generation != self.remaining_generation or not c["work_sync_enabled"] or
+                            not c["show_remaining_enabled"] or status not in {"free", "busy", "tentative", "ooo"} or not until): return
+                    phase = self.runtime["remaining_phase"]
+                if until <= datetime.now(timezone.utc):
+                    with self.lock:
+                        if generation == self.remaining_generation:
+                            self._cancel_remaining_locked(); self.force = True
+                    self.wake.set()
+                    return
+                if phase == "card":
+                    self.device().display_remaining_text(self._remaining_text(until, status))
+                    displayed, next_phase = "remaining", "remaining"
+                else:
+                    displayed = self._display_status_card(status, c)
+                    next_phase = "card"
+                with self.lock:
+                    if generation != self.remaining_generation: return
+                    self.runtime.update(displayed_slot=displayed, remaining_phase=next_phase, last_error=None)
+                    self._schedule_remaining_locked(generation, c["remaining_interval_seconds"])
+        except Exception as exc:
+            with self.lock:
+                if generation != self.remaining_generation: return
+                self.runtime["last_error"] = str(exc)
+                self._schedule_remaining_locked(generation, self.config.get()["remaining_interval_seconds"])
+            log(f"Time remaining rotation error: {exc}")
+
     def manual(self, card, seconds, text=None, foreground="#FFFFFF", background="#000000"):
         if self.config.get()["work_sync_enabled"]: raise PermissionError("Turn work sync off first")
         # Manual durations are managed here so sound behavior is identical for
         # native themes and Draw Tool images and never changes global volume.
-        if text: self.device().display_text(text, foreground, background); card = "text"
-        else: self.device().display(card)
+        with self.device_lock:
+            if text: self.device().display_text(text, foreground, background); card = "text"
+            else: self.device().display(card, seconds)
         with self.lock:
             self._cancel_manual_locked()
             generation = self.manual_generation
@@ -214,7 +403,7 @@ class Controller:
             if generation != self.manual_generation or self.config.get()["work_sync_enabled"]: return
             self.manual_timer = None
         try:
-            self.device().stop()
+            with self.device_lock: self.device().stop()
             with self.lock: self.runtime.update(displayed_slot=None, manual_ends_at=None, last_error=None)
         except Exception as exc:
             with self.lock: self.runtime.update(manual_ends_at=None, last_error=str(exc))
@@ -223,8 +412,14 @@ class Controller:
     def stop(self):
         if self.config.get()["work_sync_enabled"]: raise PermissionError("Turn work sync off first")
         with self.lock: self._cancel_manual_locked()
-        self.device().stop()
+        with self.device_lock: self.device().stop()
         with self.lock: self.runtime.update(displayed_slot=None, last_error=None)
+
+    def force_sync(self):
+        if not self.config.get()["work_sync_enabled"]:
+            raise PermissionError("Turn auto refresh on before forcing synchronization")
+        with self.lock: self.force = True
+        self.poll()
 
     def capture_previews(self):
         if self.config.get()["work_sync_enabled"]:
@@ -232,14 +427,15 @@ class Controller:
         device = self.device()
         themes = [c for c in device.cards() if c["kind"] == "theme"]
         PREVIEW_DIR.mkdir(exist_ok=True)
-        try:
-            for index, card in enumerate(themes, 1):
-                log(f"Capturing theme preview {index}/{len(themes)}: {card['name']}")
-                device.display(card["id"], 2)
-                time.sleep(.45)
-                (PREVIEW_DIR / f"{card['id'].removeprefix('theme:')}.bmp").write_bytes(device.screen(0))
-        finally:
-            device.stop()
+        with self.device_lock:
+            try:
+                for index, card in enumerate(themes, 1):
+                    log(f"Capturing theme preview {index}/{len(themes)}: {card['name']}")
+                    device.display(card["id"], 2)
+                    time.sleep(.45)
+                    (PREVIEW_DIR / f"{card['id'].removeprefix('theme:')}.bmp").write_bytes(device.screen(0))
+            finally:
+                device.stop()
         return len(themes)
 
     def poll(self):
@@ -247,15 +443,24 @@ class Controller:
         status = str(data.get("status", "free")).strip().lower().replace("idle", "free")
         if status not in {"free", "busy", "tentative", "ooo"}: status = "free"
         until = parse_until(data.get("until"))
-        if status != "free" and until and until <= datetime.now(timezone.utc): status = "free"
-        with self.lock: changed = status != self.runtime["cloud_status"] or self.force
-        if changed:
-            if status == "free": self.device().stop(); slot = None
-            else: slot = self.config.get()["state_cards"][status]; self.device().display(slot)
-            with self.lock: self.runtime["displayed_slot"], self.force = slot, False
-            log(f"Applied {status}: {slot or 'display off'}")
-        with self.lock: self.runtime.update(cloud_status=status, cloud_until=until.isoformat() if until else None,
-                                           last_poll_at=datetime.now(timezone.utc).isoformat(), last_error=None)
+        if until and until <= datetime.now(timezone.utc):
+            if status != "free": status = "free"
+            until = None
+        with self.lock:
+            previous_until = parse_until(self.runtime["cloud_until"])
+            changed = (status != self.runtime["cloud_status"] or self.force or
+                       bool(until) != bool(previous_until))
+        with self.device_lock:
+            if changed:
+                slot = self._display_status_card(status, self.config.get())
+                log(f"Applied {status}: {slot or 'display off'}")
+            with self.lock:
+                self.runtime.update(cloud_status=status, cloud_until=until.isoformat() if until else None,
+                                    cloud_updated=data.get("updated"), displayed_slot=slot if changed else self.runtime["displayed_slot"],
+                                    last_poll_at=datetime.now(timezone.utc).isoformat(), last_error=None)
+                if changed:
+                    self.force = False
+                    self._restart_remaining_locked(status, until)
 
     def run(self):
         while True:
@@ -269,18 +474,23 @@ class Controller:
 
 class Handler(BaseHTTPRequestHandler):
     controller, web = None, None
+    max_body_bytes = 64 * 1024
     def log_message(self, fmt, *args): log("Web: " + fmt % args)
     def send_json(self, code, value):
         body=json.dumps(value).encode(); self.send_response(code); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
-    def body(self): return json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))) or b"{}")
+    def body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length < 0 or length > self.max_body_bytes: raise ValueError("Request body is too large")
+        return json.loads(self.rfile.read(length) or b"{}")
     def do_GET(self):
         p=urlparse(self.path)
         try:
             if p.path == "/":
                 body=(self.web/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
             elif p.path == "/api/app/state": self.send_json(200,self.controller.state())
+            elif p.path == "/api/app/about": self.send_json(200,self.controller.device().info())
             elif p.path == "/api/app/screen":
-                body=self.controller.device().screen(int(parse_qs(p.query).get("display",[0])[0])); self.send_response(200); self.send_header("Content-Type","image/bmp"); self.send_header("Cache-Control","no-store"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+                q=parse_qs(p.query); body=self.controller.screen(int(q.get("display",[0])[0]),q.get("fresh",["0"])[0]=="1"); self.send_response(200); self.send_header("Content-Type","image/bmp"); self.send_header("Cache-Control","no-store"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
             elif p.path == "/api/app/asset":
                 body=self.controller.device().asset(parse_qs(p.query).get("name",[""])[0]); self.send_response(200); self.send_header("Content-Type","image/png"); self.send_header("Cache-Control","no-store"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
             elif p.path == "/api/app/theme-preview":
@@ -300,14 +510,17 @@ class Handler(BaseHTTPRequestHandler):
                 b=self.body(); seconds=b.get("duration_seconds"); self.controller.manual(str(b.get("slot","")),int(seconds) if seconds not in (None,"") else None,b.get("text"),b.get("foreground","#FFFFFF"),b.get("background","#000000"))
             elif self.path == "/api/app/stop": self.controller.stop()
             elif self.path == "/api/app/capture-previews": self.controller.capture_previews()
+            elif self.path == "/api/app/sync": self.controller.force_sync()
             else: return self.send_json(404,{"error":"Not found"})
             self.send_json(200,{"ok":True})
         except PermissionError as exc: self.send_json(409,{"error":str(exc)})
         except Exception as exc: self.send_json(400,{"error":str(exc)})
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument("--host",default="127.0.0.1"); p.add_argument("--port",type=int,default=8765); p.add_argument("--config",type=Path,default=Path(__file__).with_name("config.json")); a=p.parse_args()
-    controller=Controller(Config(a.config)); Handler.controller=controller; Handler.web=Path(__file__).with_name("web")
+    p=argparse.ArgumentParser(); p.add_argument("--host",default="127.0.0.1"); p.add_argument("--port",type=int,default=8765); p.add_argument("--config",type=Path,default=DATA_DIR/"config.json"); a=p.parse_args()
+    a.config.parent.mkdir(parents=True,exist_ok=True)
+    migrate_preview_colors()
+    controller=Controller(Config(a.config)); Handler.controller=controller; Handler.web=RESOURCE_DIR/"web"
     threading.Thread(target=controller.run,daemon=True).start(); server=ThreadingHTTPServer((a.host,a.port),Handler)
     log(f"Web interface: http://{a.host}:{a.port}")
     try: server.serve_forever()
