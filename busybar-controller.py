@@ -114,7 +114,17 @@ class Device:
         if os.getenv("BUSYBAR_API_TOKEN"): self.session.headers["X-API-Token"] = os.environ["BUSYBAR_API_TOKEN"]
 
     def request(self, method, path, **kwargs):
-        r = self.session.request(method, self.url + path, timeout=5, **kwargs); r.raise_for_status(); return r
+        r = self.session.request(method, self.url + path, timeout=5, **kwargs)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            # requests' default exception omits the device response, which can
+            # contain the only useful explanation for a firmware/API failure.
+            detail = " ".join((r.text or "").split())[:500]
+            log(f"Device API {method.upper()} {path} returned {r.status_code}"
+                + (f": {detail}" if detail else ""))
+            raise
+        return r
 
     def profile(self, slot):
         if slot not in SLOTS: raise ValueError("Unknown card")
@@ -211,7 +221,17 @@ class Device:
 
     def clear_draws(self):
         for app in ("draw_tool", "busybar_status"):
-            self.request("DELETE", "/api/display/draw", params={"application_name": app})
+            try:
+                self.request("DELETE", "/api/display/draw", params={"application_name": app})
+            except requests.HTTPError as exc:
+                # Firmware 1.2.4 can return 400 when an application has no
+                # active Canvas elements. Clearing is idempotent cleanup, so
+                # that response must not prevent the replacement display from
+                # being sent. Preserve scoped clears to avoid affecting Canvas
+                # content owned by another application.
+                if exc.response is None or exc.response.status_code != 400:
+                    raise
+                log(f"Ignoring empty/unsupported display cleanup for {app}")
 
     def stop_busy(self):
         current = self.request("GET", "/api/busy/snapshot").json()
@@ -261,7 +281,7 @@ class Controller:
         self.config, self.lock, self.device_lock, self.wake = config, threading.RLock(), threading.RLock(), threading.Event()
         self.runtime = {"cloud_status": None, "cloud_until": None, "cloud_updated": None, "displayed_slot": None,
                         "manual_ends_at": None, "remaining_phase": None, "remaining_next_at": None,
-                        "last_poll_at": None, "last_error": None}
+                        "last_poll_at": None, "last_successful_fetch_at": None, "last_error": None}
         self.force, self.manual_timer, self.manual_generation = True, None, 0
         self.remaining_timer, self.remaining_generation = None, 0
         self.screen_cache = {}
@@ -455,9 +475,10 @@ class Controller:
                 slot = self._display_status_card(status, self.config.get())
                 log(f"Applied {status}: {slot or 'display off'}")
             with self.lock:
+                fetched_at = datetime.now(timezone.utc).isoformat()
                 self.runtime.update(cloud_status=status, cloud_until=until.isoformat() if until else None,
                                     cloud_updated=data.get("updated"), displayed_slot=slot if changed else self.runtime["displayed_slot"],
-                                    last_poll_at=datetime.now(timezone.utc).isoformat(), last_error=None)
+                                    last_poll_at=fetched_at, last_successful_fetch_at=fetched_at, last_error=None)
                 if changed:
                     self.force = False
                     self._restart_remaining_locked(status, until)
